@@ -5,44 +5,59 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from nltk.stem import WordNetLemmatizer
-from nltk.downloader import DownloadError 
-import pickle # Used to save words and classes
+import pickle
 
-# --- NLTK Downloads (Initial Setup) ---
+# --- NLTK Downloads and Setup (Robust) ---
+# Note: Using generic Exception to avoid DownloadError import issues
 try:
     nltk.data.find('tokenizers/punkt')
-except DownloadError:
+except Exception: 
     nltk.download('punkt')
-    
 try:
     nltk.data.find('corpora/wordnet')
-except DownloadError:
+except Exception: 
     nltk.download('wordnet')
-    
 try:
     nltk.data.find('corpora/omw-1.4')
-except DownloadError:
+except Exception: 
     nltk.download('omw-1.4')
+# Additional check for the notorious punkt_tab if needed
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except Exception:
+    nltk.download('punkt_tab') 
 
-# --- 1. Data Loading and Preparation (BoW Vectorization) ---
+# --- Helper Functions (Ensures consistency) ---
 lemmatizer = WordNetLemmatizer()
+
+def tokenize(sentence):
+    return nltk.word_tokenize(sentence)
+
+def bag_of_words(tokenized_sentence, words):
+    """Creates the Bag of Words vector for the given sentence."""
+    sentence_words = [lemmatizer.lemmatize(word.lower()) for word in tokenized_sentence]
+    bag = np.zeros(len(words), dtype=np.float32)
+    for idx, w in enumerate(words):
+        if w in sentence_words:
+            bag[idx] = 1.0
+    return bag
+
+# --- 1. Data Loading and Preparation ---
 words = []
 classes = []
 documents = []
 ignore_words = ['?', '!', '.', ',']
 
-# Load intents (Assumes intents.json is in the same directory)
 try:
     with open('intents.json') as data_file:
         intents = json.loads(data_file.read())
 except FileNotFoundError:
-    print("Error: 'intents.json' file not found. Please create it first.")
+    print("Error: 'intents.json' file not found.")
     exit()
 
-# Tokenize and build vocabulary/classes
 for intent in intents['intents']:
     for pattern in intent['patterns']:
-        w = nltk.word_tokenize(pattern)
+        w = tokenize(pattern)
         words.extend(w)
         documents.append((w, intent['tag']))
     if intent['tag'] not in classes:
@@ -52,80 +67,44 @@ words = [lemmatizer.lemmatize(w.lower()) for w in words if w not in ignore_words
 words = sorted(list(set(words)))
 classes = sorted(list(set(classes)))
 
-# Function to create BoW for a sentence
-def bag_of_words(tokenized_sentence, words):
-    sentence_words = [lemmatizer.lemmatize(word.lower()) for word in tokenized_sentence]
-    bag = np.zeros(len(words), dtype=np.float32)
-    for idx, w in enumerate(words):
-        if w in sentence_words:
-            bag[idx] = 1.0
-    return bag
-
-# Create training arrays
-X_train = [] # Features: Bag of Words vectors
-y_train = [] # Labels: Intent Indices
-
+# Create training arrays (X_train and y_train)
+X_train = []
+y_train = []
 for pattern_sentence, tag in documents:
     bag = bag_of_words(pattern_sentence, words)
     X_train.append(bag)
-
     label = classes.index(tag)
     y_train.append(label)
 
 X_train = np.array(X_train)
 y_train = np.array(y_train)
 
-# ... (Part 1: Data Loading and Preparation)
-
-# Load intents (Assumes intents.json is in the same directory)
-try:
-    with open('intents.json') as data_file:
-        intents = json.loads(data_file.read())
-except FileNotFoundError:
-    print("Error: 'intents.json' file not found. Please create it first.")
-    exit()
-
-# Tokenize and build vocabulary/classes
-for intent in intents['intents']:
-    for pattern in intent['patterns']:
-        w = nltk.word_tokenize(pattern)
-        words.extend(w)
-        documents.append((w, intent['tag'])) # <--- This is where line 169 might be
-        
-    # Ensure this check is SEPARATE from the above line
-    if intent['tag'] not in classes: 
-        classes.append(intent['tag'])
-# --- 2. PyTorch Setup and Model Definition ---
+# --- 2. PyTorch Model Definition and Training ---
 
 # Hyperparameters
 NUM_EPOCHS = 200
 BATCH_SIZE = 8
 LEARNING_RATE = 0.001
-INPUT_SIZE = len(X_train[0])
+INPUT_SIZE = len(X_train[0]) # FINAL INPUT SIZE
 HIDDEN_SIZE = 128
 OUTPUT_SIZE = len(classes)
 
-# Custom PyTorch Dataset
+print(f"DEBUG: FINAL VOCABULARY SIZE USED FOR TRAINING: {INPUT_SIZE}")
+
 class ChatDataset(Dataset):
     def __init__(self, X_data, y_data):
-        self.n_samples = len(X_data)
-        # Convert numpy arrays to torch tensors
         self.x_data = torch.from_numpy(X_data)
-        self.y_data = torch.from_numpy(y_data).long() # Labels must be Long type
+        self.y_data = torch.from_numpy(y_data).long()
 
     def __getitem__(self, index):
         return self.x_data[index], self.y_data[index]
 
     def __len__(self):
-        return self.n_samples
+        return len(self.x_data)
 
-dataset = ChatDataset(X_train, y_train)
-train_loader = DataLoader(dataset=dataset, 
-                          batch_size=BATCH_SIZE, 
-                          shuffle=True, 
-                          num_workers=0) 
+train_loader = DataLoader(dataset=ChatDataset(X_train, y_train), 
+                          batch_size=BATCH_SIZE, shuffle=True, num_workers=0) 
 
-# Define the Neural Network Model
 class NeuralNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes):
         super(NeuralNet, self).__init__()
@@ -146,20 +125,15 @@ class NeuralNet(nn.Module):
         return out
 
 model = NeuralNet(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE)
-
-# Loss and Optimizer
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-# --- 3. Training Loop ---
+# Training Loop
 print("Starting PyTorch model training...")
 for epoch in range(NUM_EPOCHS):
     for (words_batch, labels_batch) in train_loader:
-        # Forward pass
         outputs = model(words_batch)
         loss = criterion(outputs, labels_batch)
-        
-        # Backward and optimize
         optimizer.zero_grad() 
         loss.backward()       
         optimizer.step()      
@@ -167,22 +141,18 @@ for epoch in range(NUM_EPOCHS):
     if (epoch+1) % 50 == 0:
         print (f'Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {loss.item():.4f}')
 
-print(f'Final loss: {loss.item():.4f}')
-print("PyTorch training complete.")
-
-# --- 4. Save Assets ---
-
-# 4.1 Save PyTorch Model State (.pth)
+# --- 3. Save Assets ---
+# 3.1 Save PyTorch Model State (.pth)
 MODEL_FILE = "chatbot_model_pytorch.pth"
 data_torch = {
 "model_state": model.state_dict(),
-"input_size": INPUT_SIZE,
+"input_size": INPUT_SIZE, # Explicitly saved input size
 "hidden_size": HIDDEN_SIZE,
 "output_size": OUTPUT_SIZE,
 }
 torch.save(data_torch, MODEL_FILE)
 
-# 4.2 Save essential non-model data (words and classes) using pickle
+# 3.2 Save essential non-model data (words and classes) using pickle
 DATA_FILE = "training_data_pytorch.pkl"
 pickle.dump({'words': words, 'classes': classes}, open(DATA_FILE, 'wb'))
 
